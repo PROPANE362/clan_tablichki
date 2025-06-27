@@ -1,188 +1,197 @@
+import telebot
+from telebot.types import ReplyKeyboardRemove
 import gspread
-from telegram import Update, ReplyKeyboardRemove
-from telegram.ext import (
-    Updater, CommandHandler, MessageHandler, Filters,
-    ConversationHandler, CallbackContext
-)
 from oauth2client.service_account import ServiceAccountCredentials
 import re
+import logging
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 # Настройки Google Sheets
-SHEET_NAME = "Название вашей таблицы"  # Замените на своё
-SERVICE_ACCOUNT_FILE = "service_account.json"  # Путь к JSON-ключу
+SHEET_NAME = "[SS] Saturn"
+SERVICE_ACCOUNT_FILE = "service_account.json"
 
 # Состояния диалога
-GET_NICKNAME, GET_POINTS, GET_SQUAD_POWER, MODERATOR_SET_SHEET = range(4)
+GET_NICKNAME, GET_POINTS, GET_SQUAD_POWER = range(3)
 
 # Глобальные переменные
-current_sheet_name = "Лист1"  # Лист по умолчанию
+current_sheet_name = "Лист1"
 MODERATOR_CHAT_ID = 123456789  # Замените на ваш Telegram ID
+
+# Инициализация бота
+bot = telebot.TeleBot("YOUR_BOT_TOKEN")  # Замените на ваш токен
+
+# Хранилище данных пользователей
+user_data = {}
 
 
 # Авторизация в Google Sheets
 def get_google_client():
-    scope = ["https://spreadsheets.google.com/feeds",
-             "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name(SERVICE_ACCOUNT_FILE, scope)
-    return gspread.authorize(creds)
+    try:
+        scope = ["https://spreadsheets.google.com/feeds",
+                 "https://www.googleapis.com/auth/drive"]
+        creds = ServiceAccountCredentials.from_json_keyfile_name(SERVICE_ACCOUNT_FILE, scope)
+        return gspread.authorize(creds)
+    except Exception as e:
+        logger.error(f"Ошибка при авторизации в Google Sheets: {e}")
+        raise
 
 
 def get_google_sheet(sheet_name=None):
-    client = get_google_client()
-    spreadsheet = client.open(SHEET_NAME)
+    try:
+        client = get_google_client()
+        spreadsheet = client.open(SHEET_NAME)
 
-    if sheet_name:
-        try:
-            return spreadsheet.worksheet(sheet_name)
-        except gspread.exceptions.WorksheetNotFound:
-            # Если лист не найден, копируем последний лист
-            worksheets = spreadsheet.worksheets()
-            if worksheets:
-                last_sheet = worksheets[-1]
-                new_sheet = last_sheet.duplicate(new_sheet_name=sheet_name)
-                return new_sheet
-            else:
-                # Если нет ни одного листа, создаем новый
-                return spreadsheet.add_worksheet(title=sheet_name, rows=100, cols=20)
-    return spreadsheet.sheet1
+        if sheet_name:
+            try:
+                return spreadsheet.worksheet(sheet_name)
+            except gspread.exceptions.WorksheetNotFound:
+                worksheets = spreadsheet.worksheets()
+                if worksheets:
+                    last_sheet = worksheets[-1]
+                    new_sheet = last_sheet.duplicate(new_sheet_name=sheet_name)
+                    return new_sheet
+                else:
+                    return spreadsheet.add_worksheet(title=sheet_name, rows=100, cols=20)
+        return spreadsheet.sheet1
+    except Exception as e:
+        logger.error(f"Ошибка при получении листа: {e}")
+        raise
 
 
-# Поиск ника в столбце A (без учёта регистра)
 def find_nickname_row(sheet, nickname):
-    nicknames = sheet.col_values(1)  # Все ники из столбца A
-    for idx, nick in enumerate(nicknames, start=1):
-        if nick.lower() == nickname.lower():
-            return idx  # Возвращает номер строки
-    return None
+    try:
+        nicknames = sheet.col_values(1)
+        for idx, nick in enumerate(nicknames, start=1):
+            if nick.lower() == nickname.lower():
+                return idx
+        return None
+    except Exception as e:
+        logger.error(f"Ошибка при поиске ника: {e}")
+        return None
 
 
-# Команда /start
-def start(update: Update, context: CallbackContext) -> int:
-    update.message.reply_text(
+# Обработчик команды /start
+@bot.message_handler(commands=['start'])
+def start(message):
+    user_id = message.from_user.id
+    user_data[user_id] = {'state': GET_NICKNAME}
+
+    bot.send_message(
+        message.chat.id,
         "Введи свой ник (регистр не важен):",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=ReplyKeyboardRemove()
     )
-    return GET_NICKNAME
 
 
-# Обработка ника
-def get_nickname(update: Update, context: CallbackContext) -> int:
-    nickname = update.message.text.strip()
-    sheet = get_google_sheet(current_sheet_name)
+# Обработчик команды /set_sheet (только для модератора)
+@bot.message_handler(commands=['set_sheet'])
+def set_sheet(message):
+    if message.from_user.id != MODERATOR_CHAT_ID:
+        bot.reply_to(message, "❌ Эта команда только для модераторов!")
+        return
+
+    user_id = message.from_user.id
+    user_data[user_id] = {'state': 'MODERATOR_SET_SHEET'}
+
+    bot.send_message(
+        message.chat.id,
+        "Введи название листа (например, 'Лист2'):",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
+
+# Обработчик текстовых сообщений
+@bot.message_handler(func=lambda message: True)
+def handle_text(message):
+    user_id = message.from_user.id
+    state = user_data.get(user_id, {}).get('state')
+
+    if state == GET_NICKNAME:
+        process_nickname(message)
+    elif state == GET_POINTS:
+        process_points(message)
+    elif state == GET_SQUAD_POWER:
+        process_squad_power(message)
+    elif state == 'MODERATOR_SET_SHEET':
+        process_moderator_sheet(message)
+
+
+def process_nickname(message):
+    user_id = message.from_user.id
+    nickname = message.text.strip()
 
     if not nickname:
-        update.message.reply_text("Ник не может быть пустым. Попробуй ещё раз:")
-        return GET_NICKNAME
+        bot.send_message(message.chat.id, "Ник не может быть пустым. Попробуй ещё раз:")
+        return
 
+    sheet = get_google_sheet(current_sheet_name)
     row = find_nickname_row(sheet, nickname)
+
     if row:
-        context.user_data["row"] = row
-        update.message.reply_text("Ник найден! Теперь введи количество очков:")
+        user_data[user_id] = {'state': GET_POINTS, 'row': row}
+        bot.send_message(message.chat.id, "Ник найден! Теперь введи количество очков:")
     else:
-        # Добавляем ник в первую свободную строку
         next_row = len(sheet.col_values(1)) + 1
-        sheet.update_cell(next_row, 1, nickname)  # Столбец A
-        context.user_data["row"] = next_row
-        update.message.reply_text("Ник добавлен! Теперь введи количество очков:")
-
-    return GET_POINTS
+        sheet.update_cell(next_row, 1, nickname)
+        user_data[user_id] = {'state': GET_POINTS, 'row': next_row}
+        bot.send_message(message.chat.id, "Ник добавлен! Теперь введи количество очков:")
 
 
-# Обработка очков
-def get_points(update: Update, context: CallbackContext) -> int:
-    points_text = update.message.text.strip()
+def process_points(message):
+    user_id = message.from_user.id
+    points_text = message.text.strip()
+
     if not re.match(r"^\d+$", points_text):
-        update.message.reply_text("Нужно ввести число! Попробуй ещё раз:")
-        return GET_POINTS
+        bot.send_message(message.chat.id, "Нужно ввести число! Попробуй ещё раз:")
+        return
 
     points = int(points_text)
-    row = context.user_data["row"]
+    row = user_data[user_id]['row']
     sheet = get_google_sheet(current_sheet_name)
 
-    sheet.update_cell(row, 2, points)  # Столбец B
-    update.message.reply_text("Теперь введи мощь отряда:")
-    return GET_SQUAD_POWER
+    sheet.update_cell(row, 2, points)
+    user_data[user_id]['state'] = GET_SQUAD_POWER
+    bot.send_message(message.chat.id, "Теперь введи мощь отряда:")
 
 
-# Обработка мощи отряда
-def get_squad_power(update: Update, context: CallbackContext) -> int:
-    power_text = update.message.text.strip()
+def process_squad_power(message):
+    user_id = message.from_user.id
+    power_text = message.text.strip()
+
     if not re.match(r"^\d+$", power_text):
-        update.message.reply_text("Нужно ввести число! Попробуй ещё раз:")
-        return GET_SQUAD_POWER
+        bot.send_message(message.chat.id, "Нужно ввести число! Попробуй ещё раз:")
+        return
 
     power = int(power_text)
-    row = context.user_data["row"]
+    row = user_data[user_id]['row']
     sheet = get_google_sheet(current_sheet_name)
 
-    sheet.update_cell(row, 5, power)  # Столбец E
-    update.message.reply_text("✅ Данные сохранены!")
-    return ConversationHandler.END
+    sheet.update_cell(row, 5, power)
+    bot.send_message(message.chat.id, "✅ Данные сохранены!")
+    user_data.pop(user_id, None)  # Удаляем данные пользователя
 
 
-# Команда для модератора (/set_sheet)
-def set_sheet(update: Update, context: CallbackContext) -> int:
-    if update.message.from_user.id != MODERATOR_CHAT_ID:
-        update.message.reply_text("❌ Эта команда только для модераторов!")
-        return ConversationHandler.END
-
-    update.message.reply_text("Введи название листа (например, 'Лист2'):")
-    return MODERATOR_SET_SHEET
-
-
-# Обработка выбора листа модератором
-def moderator_set_sheet(update: Update, context: CallbackContext) -> int:
+def process_moderator_sheet(message):
     global current_sheet_name
-    sheet_name = update.message.text.strip()
+    sheet_name = message.text.strip()
 
     try:
-        # Попытка получить лист (если его нет - он создастся автоматически)
         sheet = get_google_sheet(sheet_name)
         current_sheet_name = sheet_name
-        update.message.reply_text(f"✅ Теперь данные будут сохраняться в лист '{sheet_name}'!")
+        bot.send_message(message.chat.id, f"✅ Теперь данные будут сохраняться в лист '{sheet_name}'!")
     except Exception as e:
-        update.message.reply_text(f"❌ Ошибка: {e}. Попробуй ещё раз:")
-        return MODERATOR_SET_SHEET
+        bot.send_message(message.chat.id, f"❌ Ошибка: {e}. Попробуй ещё раз:")
+        return
 
-    return ConversationHandler.END
-
-
-# Отмена
-def cancel(update: Update, context: CallbackContext) -> int:
-    update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
-    return ConversationHandler.END
-
-
-def main():
-    # Замените 'YOUR_BOT_TOKEN' на токен вашего бота
-    updater = Updater("YOUR_BOT_TOKEN", use_context=True)
-    dp = updater.dispatcher
-
-    # Обработчик для обычных пользователей
-    user_conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            GET_NICKNAME: [MessageHandler(Filters.text & ~Filters.command, get_nickname)],
-            GET_POINTS: [MessageHandler(Filters.text & ~Filters.command, get_points)],
-            GET_SQUAD_POWER: [MessageHandler(Filters.text & ~Filters.command, get_squad_power)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
-    # Обработчик для модератора
-    moderator_conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("set_sheet", set_sheet)],
-        states={
-            MODERATOR_SET_SHEET: [MessageHandler(Filters.text & ~Filters.command, moderator_set_sheet)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
-    dp.add_handler(user_conv_handler)
-    dp.add_handler(moderator_conv_handler)
-    updater.start_polling()
-    updater.idle()
+    user_data.pop(message.from_user.id, None)  # Удаляем данные модератора
 
 
 if __name__ == "__main__":
-    main()
+    logger.info("Бот запущен")
+    bot.infinity_polling()
